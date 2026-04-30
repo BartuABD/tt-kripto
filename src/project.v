@@ -3,8 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-`default_nettype none
 
+`default_nettype none
 
 module tt_um_bartu_kripto (
     input  wire [7:0] ui_in,
@@ -17,17 +17,39 @@ module tt_um_bartu_kripto (
     input  wire       rst_n
 );
 
-   
+    /*
+        Tiny Tapeout 1x1 optimized symmetric stream cipher demo
+
+        Data block: 64 bit
+        Key:        32 bit
+
+        Operation:
+        - Data and key are loaded byte by byte.
+        - On start, an 8-bit LFSR seed is generated from the 32-bit key.
+        - For 8 cycles, one data byte is XORed with one generated keystream byte.
+        - Encryption and decryption are identical because XOR is self-inverse.
+
+        uio_in:
+        [2:0] byte address
+        [3]   load data byte
+        [4]   load key byte
+        [5]   start
+        [6]   mode, 0 encrypt / 1 decrypt, kept for interface compatibility
+        [7]   output select, 0 status / 1 data byte
+    */
+
     reg [63:0] data_reg;
     reg [31:0] key_reg;
-    reg [63:0] ks_reg;
 
-    reg [4:0] round;
-    reg       busy;
-    reg       done;
-    reg       mode;
+    reg [7:0] lfsr;
+    reg [2:0] byte_cnt;
 
-    wire [2:0] addr = uio_in[2:0];
+    reg busy;
+    reg done;
+    reg mode;
+
+    wire [2:0] addr;
+    assign addr = uio_in[2:0];
 
     assign uio_out = 8'b0000_0000;
     assign uio_oe  = 8'b0000_0000;
@@ -46,45 +68,37 @@ module tt_um_bartu_kripto (
 
     assign uo_out = uio_in[7] ? selected_output_byte : {6'b000000, done, busy};
 
-    function [63:0] rotl64_7;
-        input [63:0] x;
-        begin
-            rotl64_7 = {x[56:0], x[63:57]};
-        end
-    endfunction
+    wire [7:0] key_byte0 = key_reg[7:0];
+    wire [7:0] key_byte1 = key_reg[15:8];
+    wire [7:0] key_byte2 = key_reg[23:16];
+    wire [7:0] key_byte3 = key_reg[31:24];
 
-    function [63:0] rotl64_13;
-        input [63:0] x;
-        begin
-            rotl64_13 = {x[50:0], x[63:51]};
-        end
-    endfunction
+    wire [7:0] seed;
+    assign seed = key_byte0 ^ key_byte1 ^ key_byte2 ^ key_byte3 ^ 8'hA5;
 
-    function [63:0] next_keystream;
-        input [63:0] ks;
-        input [31:0] key;
-        input [4:0]  r;
-        reg   [63:0] round_const;
-        begin
-            round_const = {24'hA53C5A, r[3:0], 4'hF, 24'h3C5AA5, r[3:0], 4'hC};
+    /*
+        8-bit Galois/Fibonacci style LFSR next state.
+        Polynomial-like taps: x^8 + x^6 + x^5 + x^4 + 1
+    */
+    wire feedback;
+    wire [7:0] lfsr_next;
 
-            next_keystream =
-                rotl64_7(ks) ^
-                rotl64_13(ks + {key, ~key}) ^
-                round_const ^
-                {key ^ 32'hC3A5_9669, ~key ^ 32'h5A3C_F00D};
-        end
-    endfunction
+    assign feedback  = lfsr[7] ^ lfsr[5] ^ lfsr[4] ^ lfsr[3];
+    assign lfsr_next = {lfsr[6:0], feedback};
 
-    wire [63:0] ks_next;
-    assign ks_next = next_keystream(ks_reg, key_reg, round);
+    /*
+        Keystream byte also mixes current byte counter and key bytes.
+        This prevents very simple repeated output.
+    */
+    wire [7:0] ks_byte;
+    assign ks_byte = lfsr ^ key_reg[(byte_cnt[1:0] * 8) +: 8] ^ {5'b10101, byte_cnt};
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             data_reg <= 64'b0;
             key_reg  <= 32'b0;
-            ks_reg   <= 64'b0;
-            round    <= 5'b0;
+            lfsr     <= 8'b0;
+            byte_cnt <= 3'b0;
             busy     <= 1'b0;
             done     <= 1'b0;
             mode     <= 1'b0;
@@ -115,22 +129,32 @@ module tt_um_bartu_kripto (
                 end
 
                 if (uio_in[5]) begin
-                    ks_reg <= {key_reg ^ 32'h9E37_79B9, ~key_reg ^ 32'h7F4A_7C15};
-                    round  <= 5'd0;
-                    busy   <= 1'b1;
-                    done   <= 1'b0;
-                    mode   <= uio_in[6];
+                    lfsr     <= (seed == 8'h00) ? 8'h5A : seed;
+                    byte_cnt <= 3'd0;
+                    busy     <= 1'b1;
+                    done     <= 1'b0;
+                    mode     <= uio_in[6];
                 end
             end else begin
-                ks_reg <= ks_next;
+                case (byte_cnt)
+                    3'd0: data_reg[7:0]   <= data_reg[7:0]   ^ ks_byte;
+                    3'd1: data_reg[15:8]  <= data_reg[15:8]  ^ ks_byte;
+                    3'd2: data_reg[23:16] <= data_reg[23:16] ^ ks_byte;
+                    3'd3: data_reg[31:24] <= data_reg[31:24] ^ ks_byte;
+                    3'd4: data_reg[39:32] <= data_reg[39:32] ^ ks_byte;
+                    3'd5: data_reg[47:40] <= data_reg[47:40] ^ ks_byte;
+                    3'd6: data_reg[55:48] <= data_reg[55:48] ^ ks_byte;
+                    3'd7: data_reg[63:56] <= data_reg[63:56] ^ ks_byte;
+                endcase
 
-                if (round == 5'd15) begin
-                    data_reg <= data_reg ^ ks_next;
+                lfsr <= lfsr_next;
+
+                if (byte_cnt == 3'd7) begin
                     busy     <= 1'b0;
                     done     <= 1'b1;
-                    round    <= 5'd0;
+                    byte_cnt <= 3'd0;
                 end else begin
-                    round <= round + 5'd1;
+                    byte_cnt <= byte_cnt + 3'd1;
                 end
             end
         end
