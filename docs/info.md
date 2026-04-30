@@ -32,4 +32,4 @@ Encryption and decryption use the same operation:
 
 ```text
 ciphertext = plaintext XOR keystream
-plaintext  = ciphertext XOR keystream
+plaintext  = ciphertext XOR keystream 
